@@ -7,6 +7,8 @@ from services.flat_plan_engine import confirm_layout, detect_layout, estimate_fl
 
 router = APIRouter(tags=["flat-wise-estimation"])
 
+PLAN_NOT_FOUND = "Plan not found"
+
 
 class DetectLayoutRequest(BaseModel):
     project_id: int
@@ -73,7 +75,9 @@ def run_layout_detection(payload: DetectLayoutRequest, authorization: str | None
     project = _get_project(payload.project_id, user_id)
     try:
         return detect_layout(payload.plan_id, project["area"], payload.reprocess_attempt)
-    except KeyError:
+    except KeyError as exc:
+        if str(exc).strip("'\"") != PLAN_NOT_FOUND:
+            raise
         raise HTTPException(status_code=404, detail="Uploaded plan not found")
 
 
@@ -83,7 +87,9 @@ def confirm_detected_layout(payload: ConfirmLayoutRequest, authorization: str | 
     _get_project(payload.project_id, user_id)
     try:
         return confirm_layout(payload.plan_id, payload.summary, payload.rooms, payload.user_corrections)
-    except KeyError:
+    except KeyError as exc:
+        if str(exc).strip("'\"") != PLAN_NOT_FOUND:
+            raise
         raise HTTPException(status_code=404, detail="Uploaded plan not found")
 
 
@@ -93,7 +99,9 @@ def relabel_corrected_zones(payload: RelabelZonesRequest, authorization: str | N
     _get_project(payload.project_id, user_id)
     try:
         return relabel_edited_zones(payload.plan_id, payload.rooms, payload.summary, payload.user_corrections)
-    except KeyError:
+    except KeyError as exc:
+        if str(exc).strip("'\"") != PLAN_NOT_FOUND:
+            raise
         raise HTTPException(status_code=404, detail="Uploaded plan not found")
 
 
@@ -103,5 +111,7 @@ def estimate_flat_layout(payload: EstimateFlatRequest, authorization: str | None
     _get_project(payload.project_id, user_id)
     try:
         return estimate_flat(payload.plan_id, payload.rate_per_sqft, payload.tier)
-    except KeyError:
+    except KeyError as exc:
+        if str(exc).strip("'\"") != PLAN_NOT_FOUND:
+            raise
         raise HTTPException(status_code=404, detail="Uploaded plan not found")

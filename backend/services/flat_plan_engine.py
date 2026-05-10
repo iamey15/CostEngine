@@ -1277,6 +1277,7 @@ def _choose_plan_area(dxf: dict, label_hints: dict, dimension_evidence: dict, pr
     dxf = dxf or {}
     label_hints = label_hints or {}
     dimension_evidence = dimension_evidence or {}
+    dimension_edge_area = _edge_area_from_dimension_evidence(dimension_evidence) if int(dimension_evidence.get("edge_binding_axes") or 0) >= 2 else None
     named_zone_count = max(
         int(label_hints.get("named_zone_count") or 0),
         int(dxf.get("bedrooms") or 0) + int(dxf.get("bathrooms") or 0) + int(dxf.get("kitchens") or 0) + int(dxf.get("halls") or 0),
@@ -1305,6 +1306,8 @@ def _choose_plan_area(dxf: dict, label_hints: dict, dimension_evidence: dict, pr
         return float(label_hints["total_area"])
     if project_area:
         return float(project_area)
+    if trustworthy(dimension_edge_area):
+        return float(dimension_edge_area)
     if dxf.get("room_area_sum_sqft") and trustworthy(dxf["room_area_sum_sqft"]):
         return float(dxf["room_area_sum_sqft"])
     if dxf.get("total_area"):
@@ -1359,6 +1362,20 @@ def _edge_dimension_sum(boxes, edge):
     return None, 0
 
 
+def _edge_bound_span(edge_sums: dict | None, edges: tuple[str, ...]):
+    values = [float((edge_sums or {}).get(edge) or 0) for edge in edges if (edge_sums or {}).get(edge)]
+    return round(max(values), 2) if values else None
+
+
+def _edge_area_from_dimension_evidence(dimension_evidence: dict | None):
+    edge_sums = (dimension_evidence or {}).get("edge_sums_ft") or {}
+    width = (dimension_evidence or {}).get("exterior_width_ft") or _edge_bound_span(edge_sums, ("top", "bottom"))
+    depth = (dimension_evidence or {}).get("exterior_depth_ft") or _edge_bound_span(edge_sums, ("left", "right"))
+    if width and depth:
+        return round(float(width) * float(depth), 1)
+    return None
+
+
 def _extract_dimension_evidence(text: str, base_area: float | None = None, dimension_boxes=None):
     normalized = _normalize_arch_text(text)
     raw_tokens = re.findall(r"\b\d{1,3}\s*(?:'|-)\s*\d{1,2}\s*(?:\"|IN)?|\b\d{1,3}\s*'\s*|\b\d{1,3}\s*FT\b", normalized)
@@ -1396,6 +1413,7 @@ def _extract_dimension_evidence(text: str, base_area: float | None = None, dimen
 
     horizontal_values = [edge_sums[edge] for edge in ("top", "bottom") if edge in edge_sums]
     vertical_values = [edge_sums[edge] for edge in ("left", "right") if edge in edge_sums]
+    edge_area = round(max(horizontal_values) * max(vertical_values), 1) if horizontal_values and vertical_values else None
     exterior_width = max(horizontal_values) if horizontal_values else None
     exterior_depth = max(vertical_values) if vertical_values else None
     sorted_dims = sorted(unique_dims, reverse=True)
@@ -1424,14 +1442,18 @@ def _extract_dimension_evidence(text: str, base_area: float | None = None, dimen
         confidence += 20
     if horizontal_values and vertical_values and exterior_width and exterior_depth:
         confidence = max(confidence, 82)
+    elif horizontal_values and vertical_values:
+        confidence = max(confidence, 74)
     return {
         "dimensions_ft": sorted(unique_dims),
         "dimension_count": len(unique_dims),
         "dimension_boxes": boxes,
         "edge_sums_ft": edge_sums,
         "edge_dimension_counts": edge_counts,
+        "edge_binding_axes": int(bool(horizontal_values)) + int(bool(vertical_values)),
         "room_area_values_sqft": room_area_values[:24],
         "area_from_text_sqft": round(total_area, 1) if total_area else None,
+        "edge_area_sqft": edge_area,
         "exterior_width_ft": round(exterior_width, 2) if exterior_width else None,
         "exterior_depth_ft": round(exterior_depth, 2) if exterior_depth else None,
         "confidence": min(100, confidence),
@@ -1477,13 +1499,28 @@ def _merge_dimension_evidence(primary: dict | None, fallback: dict | None):
             for value in [*(primary.get("dimensions_ft") or []), *(fallback.get("dimensions_ft") or [])]
         }
     )
-    merged["dimension_count"] = max(int(primary.get("dimension_count") or 0), int(fallback.get("dimension_count") or 0))
+    merged["dimension_count"] = len(merged["dimensions_ft"])
     merged["confidence"] = round(max(float(primary.get("confidence") or 0), float(fallback.get("confidence") or 0)), 1)
-    merged["dimension_boxes"] = primary.get("dimension_boxes") or fallback.get("dimension_boxes") or []
-    merged["edge_sums_ft"] = primary.get("edge_sums_ft") or fallback.get("edge_sums_ft") or {}
-    merged["edge_dimension_counts"] = primary.get("edge_dimension_counts") or fallback.get("edge_dimension_counts") or {}
+    merged["dimension_boxes"] = _dedupe_dimension_boxes([*(primary.get("dimension_boxes") or []), *(fallback.get("dimension_boxes") or [])])
+    merged["edge_sums_ft"] = {
+        **(fallback.get("edge_sums_ft") or {}),
+        **(primary.get("edge_sums_ft") or {}),
+    }
+    merged["edge_dimension_counts"] = {
+        edge: max(
+            int((primary.get("edge_dimension_counts") or {}).get(edge) or 0),
+            int((fallback.get("edge_dimension_counts") or {}).get(edge) or 0),
+        )
+        for edge in set((primary.get("edge_dimension_counts") or {}).keys()) | set((fallback.get("edge_dimension_counts") or {}).keys())
+    }
+    merged["edge_binding_axes"] = max(
+        int(primary.get("edge_binding_axes") or 0),
+        int(fallback.get("edge_binding_axes") or 0),
+        int(bool(_edge_bound_span(merged["edge_sums_ft"], ("top", "bottom")))) + int(bool(_edge_bound_span(merged["edge_sums_ft"], ("left", "right")))),
+    )
     merged["room_area_values_sqft"] = primary.get("room_area_values_sqft") or fallback.get("room_area_values_sqft") or []
     merged["area_from_text_sqft"] = primary.get("area_from_text_sqft") or fallback.get("area_from_text_sqft")
+    merged["edge_area_sqft"] = primary.get("edge_area_sqft") or fallback.get("edge_area_sqft") or _edge_area_from_dimension_evidence(merged)
     if primary.get("exterior_width_ft") or primary.get("exterior_depth_ft"):
         merged["source_prefix"] = primary.get("source_prefix") or "ocr"
     elif fallback:
@@ -1591,6 +1628,128 @@ def _room_label_anchor(room: dict, bounds: dict | None = None):
     return round(x, 1), round(y, 1)
 
 
+def _anchor_interval_around_value(value: float, minimum: float, maximum: float, anchors: list[float]):
+    points = sorted(set([minimum, maximum, *[float(anchor) for anchor in anchors if minimum < float(anchor) < maximum]]))
+    if len(points) < 2:
+        return minimum, maximum
+    for index in range(len(points) - 1):
+        left = points[index]
+        right = points[index + 1]
+        if left <= value <= right:
+            return left, right
+    return minimum, maximum
+
+
+def _tighten_room_bounds_to_label_cell(room: dict, bounds: dict, x_anchors: list[float], y_anchors: list[float]):
+    bounds = {
+        **bounds,
+        "width": round(max(0.01, float(bounds["max_x"]) - float(bounds["min_x"])), 2),
+        "height": round(max(0.01, float(bounds["max_y"]) - float(bounds["min_y"])), 2),
+    }
+    source = str(room.get("source") or "")
+    if not source.startswith(("ocr-anchor", "ocr-anchored", "wall-line-snap", "label-fallback-fit")):
+        return bounds, False
+    internal_x = [value for value in x_anchors if bounds["min_x"] + 1.6 < value < bounds["max_x"] - 1.6]
+    internal_y = [value for value in y_anchors if bounds["min_y"] + 1.6 < value < bounds["max_y"] - 1.6]
+    if not internal_x and not internal_y:
+        return bounds, False
+    room_label = str(room.get("label") or "")
+    generic_zone = room_label.startswith("Common Zone") or room_label.startswith("Service Zone")
+    confidence = float(room.get("confidence") or 0)
+    if not generic_zone and confidence >= 0.76 and len(internal_x) + len(internal_y) < 3:
+        return bounds, False
+
+    label_x, label_y = _room_label_anchor(room, bounds)
+    tightened = dict(bounds)
+    if internal_x:
+        left, right = _anchor_interval_around_value(label_x, bounds["min_x"], bounds["max_x"], internal_x)
+        max_width = bounds["width"] * (0.9 if generic_zone else 0.78)
+        if right - left >= 4.0 and right - left <= max_width:
+            tightened["min_x"] = left
+            tightened["max_x"] = right
+    if internal_y:
+        top, bottom = _anchor_interval_around_value(label_y, bounds["min_y"], bounds["max_y"], internal_y)
+        max_height = bounds["height"] * (0.9 if generic_zone else 0.8)
+        if bottom - top >= 4.0 and bottom - top <= max_height:
+            tightened["min_y"] = top
+            tightened["max_y"] = bottom
+
+    tightened["min_x"] = max(0.0, min(121.0, tightened["min_x"]))
+    tightened["max_x"] = max(tightened["min_x"] + 4.0, min(125.0, tightened["max_x"]))
+    tightened["min_y"] = max(0.0, min(88.0, tightened["min_y"]))
+    tightened["max_y"] = max(tightened["min_y"] + 4.0, min(92.0, tightened["max_y"]))
+    tightened["width"] = round(max(0.01, tightened["max_x"] - tightened["min_x"]), 2)
+    tightened["height"] = round(max(0.01, tightened["max_y"] - tightened["min_y"]), 2)
+    changed = (
+        abs(tightened["min_x"] - bounds["min_x"]) > 0.2
+        or abs(tightened["max_x"] - bounds["max_x"]) > 0.2
+        or abs(tightened["min_y"] - bounds["min_y"]) > 0.2
+        or abs(tightened["max_y"] - bounds["max_y"]) > 0.2
+    )
+    return (tightened if changed else bounds), changed
+
+
+def _label_anchor_candidates(room: dict, bounds: dict):
+    explicit = room.get("label_x"), room.get("label_y")
+    candidates = []
+    if explicit[0] is not None and explicit[1] is not None:
+        x = float(explicit[0])
+        y = float(explicit[1])
+        if bounds["min_x"] + 1 <= x <= bounds["max_x"] - 1 and bounds["min_y"] + 2 <= y <= bounds["max_y"] - 2:
+            candidates.append((round(x, 1), round(y, 1)))
+    left = round(bounds["min_x"] + min(max(bounds["width"] * 0.14, 1.4), 6.8), 1)
+    center = round((bounds["min_x"] + bounds["max_x"]) / 2, 1)
+    right = round(bounds["max_x"] - min(max(bounds["width"] * 0.18, 2.2), 8.6), 1)
+    top = round(min(bounds["max_y"] - 5.0, bounds["min_y"] + min(max(bounds["height"] * 0.24, 5.0), 7.8)), 1)
+    middle = round((bounds["min_y"] + bounds["max_y"]) / 2, 1)
+    for candidate in ((left, top), (center, top), (right, top), (left, middle), (center, middle)):
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _deconflict_label_anchors(rooms: list):
+    if not rooms:
+        return 0
+    chosen = []
+    for index in sorted(
+        range(len(rooms)),
+        key=lambda idx: (
+            float(rooms[idx].get("graph_degree") or 0),
+            float(rooms[idx].get("confidence") or 0),
+            float(rooms[idx].get("area_sqft") or 0),
+        ),
+        reverse=True,
+    ):
+        room = rooms[index]
+        bounds = room.get("bbox") or _room_bounds(room)
+        center_x = (bounds["min_x"] + bounds["max_x"]) / 2
+        center_y = (bounds["min_y"] + bounds["max_y"]) / 2
+        best = None
+        best_score = None
+        for candidate in _label_anchor_candidates(room, bounds):
+            min_distance = min((math.hypot(candidate[0] - point[0], candidate[1] - point[1]) for point in chosen), default=999.0)
+            score = min_distance - math.hypot(candidate[0] - center_x, candidate[1] - center_y) * 0.08
+            if best is None or score > best_score:
+                best = candidate
+                best_score = score
+        if best:
+            room["label_x"] = round(best[0], 1)
+            room["label_y"] = round(best[1], 1)
+            room["label_area_y"] = round(min(bounds["max_y"] - 1.4, best[1] + 4.3), 1)
+            chosen.append(best)
+    conflicts = 0
+    for left in range(len(rooms)):
+        left_room = rooms[left]
+        left_anchor = (float(left_room.get("label_x") or 0), float(left_room.get("label_y") or 0))
+        for right in range(left + 1, len(rooms)):
+            right_room = rooms[right]
+            right_anchor = (float(right_room.get("label_x") or 0), float(right_room.get("label_y") or 0))
+            if math.hypot(left_anchor[0] - right_anchor[0], left_anchor[1] - right_anchor[1]) < 5.4:
+                conflicts += 1
+    return conflicts
+
+
 def _refine_rooms_with_wall_graph(rooms: list):
     if not rooms:
         return {
@@ -1603,12 +1762,15 @@ def _refine_rooms_with_wall_graph(rooms: list):
                 "connectivity_score": 0.0,
                 "envelope_width_units": 0.0,
                 "envelope_height_units": 0.0,
+                "tightened_room_count": 0,
+                "label_conflict_count": 0,
             },
         }
 
     refined = [dict(room) for room in rooms]
     x_anchors = _merge_axis_anchors([value for room in refined for value in (_room_bounds(room)["min_x"], _room_bounds(room)["max_x"])])
     y_anchors = _merge_axis_anchors([value for room in refined for value in (_room_bounds(room)["min_y"], _room_bounds(room)["max_y"])])
+    tightened_room_count = 0
 
     for room in refined:
         bounds = _room_bounds(room)
@@ -1622,6 +1784,9 @@ def _refine_rooms_with_wall_graph(rooms: list):
             snapped["max_x"] = min(125.0, snapped["min_x"] + 4.0)
         if snapped["max_y"] - snapped["min_y"] < 4:
             snapped["max_y"] = min(92.0, snapped["min_y"] + 4.0)
+        snapped, changed = _tighten_room_bounds_to_label_cell(room, snapped, x_anchors, y_anchors)
+        if changed:
+            tightened_room_count += 1
         room["x"] = round(snapped["min_x"], 1)
         room["y"] = round(snapped["min_y"], 1)
         room["width"] = round(snapped["max_x"] - snapped["min_x"], 1)
@@ -1705,6 +1870,8 @@ def _refine_rooms_with_wall_graph(rooms: list):
         room["overlap_ratio"] = round(min(1.0, overlap_penalty), 3)
         room["confidence"] = round(max(0.42, min(0.94, float(room.get("confidence") or 0.58) + min(room["graph_degree"], 3) * 0.03 - min(room["overlap_ratio"], 0.4) * 0.22)), 2)
 
+    label_conflict_count = _deconflict_label_anchors(refined)
+
     envelope = {
         "min_x": min(room["bbox"]["min_x"] for room in refined),
         "max_x": max(room["bbox"]["max_x"] for room in refined),
@@ -1726,25 +1893,44 @@ def _refine_rooms_with_wall_graph(rooms: list):
             "connectivity_score": round(connectivity_score, 3),
             "envelope_width_units": round(envelope_width, 2),
             "envelope_height_units": round(envelope_height, 2),
+            "tightened_room_count": tightened_room_count,
+            "label_conflict_count": label_conflict_count,
         },
     }
 
 
-def _geometry_takeoff(rooms: list, built_up_area: float, carpet_area: float, wall_thickness_ft: float, dimension_evidence: dict | None = None, graph: dict | None = None):
+def _geometry_takeoff(rooms: list, built_up_area: float, carpet_area: float, wall_thickness_ft: float, dimension_evidence: dict | None = None, graph: dict | None = None, learning: dict | None = None):
     evidence = dimension_evidence or {}
     graph = graph if graph is not None else (_refine_rooms_with_wall_graph(rooms).get("graph", {}) if rooms else {})
     width = evidence.get("exterior_width_ft")
     depth = evidence.get("exterior_depth_ft")
+    width_from_edge = False
+    depth_from_edge = False
     envelope_width_units = float(graph.get("envelope_width_units") or 0)
     envelope_height_units = float(graph.get("envelope_height_units") or 0)
     envelope_aspect = float(evidence.get("aspect_hint") or 0) or (envelope_width_units / envelope_height_units if envelope_width_units and envelope_height_units else 1.28)
     envelope_aspect = max(0.55, min(2.4, envelope_aspect))
     source_prefix = str(evidence.get("source_prefix") or "ocr")
     calibrated_from_area = bool(evidence.get("calibrated_from_area"))
+    edge_sums = evidence.get("edge_sums_ft") or {}
+    edge_bound_width = _edge_bound_span(edge_sums, ("top", "bottom"))
+    edge_bound_depth = _edge_bound_span(edge_sums, ("left", "right"))
+    if not width and edge_bound_width:
+        width = float(edge_bound_width)
+        width_from_edge = True
+    if not depth and edge_bound_depth:
+        depth = float(edge_bound_depth)
+        depth_from_edge = True
     if width and depth:
         external_wall_length = 2 * (float(width) + float(depth))
         if calibrated_from_area and source_prefix == "dxf":
             dimension_source = "dxf-envelope-area-calibrated"
+        elif width_from_edge and depth_from_edge:
+            dimension_source = f"{source_prefix}-edge-bound-graph"
+        elif width_from_edge:
+            dimension_source = f"{source_prefix}-edge-width-graph"
+        elif depth_from_edge:
+            dimension_source = f"{source_prefix}-edge-depth-graph"
         else:
             dimension_source = f"{source_prefix}-dimensions"
     elif width:
@@ -1753,14 +1939,14 @@ def _geometry_takeoff(rooms: list, built_up_area: float, carpet_area: float, wal
         depth_from_graph = max(8.0, width / envelope_aspect)
         depth = round(depth_from_graph * 0.65 + depth_from_area * 0.35, 2)
         external_wall_length = 2 * (width + depth)
-        dimension_source = f"{source_prefix}-width-wall-graph"
+        dimension_source = f"{source_prefix}-edge-width-wall-graph" if width_from_edge else f"{source_prefix}-width-wall-graph"
     elif depth:
         depth = float(depth)
         width_from_area = max(8.0, built_up_area / depth)
         width_from_graph = max(8.0, depth * envelope_aspect)
         width = round(width_from_graph * 0.65 + width_from_area * 0.35, 2)
         external_wall_length = 2 * (width + depth)
-        dimension_source = f"{source_prefix}-depth-wall-graph"
+        dimension_source = f"{source_prefix}-edge-depth-wall-graph" if depth_from_edge else f"{source_prefix}-depth-wall-graph"
     else:
         aspect = envelope_aspect
         width = math.sqrt(max(built_up_area, 1) * aspect)
@@ -1775,16 +1961,27 @@ def _geometry_takeoff(rooms: list, built_up_area: float, carpet_area: float, wal
     unit_scale = sum(active_scales) / len(active_scales) if active_scales else 0
     graph_internal_length = float(graph.get("shared_wall_units") or 0) * unit_scale if unit_scale else 0
     fallback_internal_length = raw_internal_units / max(125 + 92, 1) * external_wall_length * 1.7 if rooms else built_up_area * 0.12
+    learned_internal_ratio = float((learning or {}).get("internal_wall_length_per_sqft") or 0)
+    if 0.04 <= learned_internal_ratio <= 0.24:
+        learned_internal_length = built_up_area * learned_internal_ratio
+        fallback_internal_length = (fallback_internal_length * 0.55 + learned_internal_length * 0.45) if fallback_internal_length else learned_internal_length
+    else:
+        learned_internal_length = 0
     reported_shared_wall_length = graph_internal_length or (fallback_internal_length * 0.45 if rooms else 0)
     if graph_internal_length and fallback_internal_length:
         internal_wall_length = graph_internal_length * 0.7 + fallback_internal_length * 0.3
-        internal_wall_source = "shared-wall-graph"
+        internal_wall_source = "shared-wall-graph+learning" if learned_internal_length else "shared-wall-graph"
     else:
-        internal_wall_length = graph_internal_length or fallback_internal_length
-        internal_wall_source = "perimeter-fallback" if fallback_internal_length else "none"
+        internal_wall_length = graph_internal_length or learned_internal_length or fallback_internal_length
+        if graph_internal_length:
+            internal_wall_source = "shared-wall-graph"
+        elif learned_internal_length:
+            internal_wall_source = "learning-calibrated-fallback"
+        else:
+            internal_wall_source = "perimeter-fallback" if fallback_internal_length else "none"
     if not rooms:
-        internal_wall_length = built_up_area * 0.12
-        internal_wall_source = "area-fallback"
+        internal_wall_length = learned_internal_length or built_up_area * 0.12
+        internal_wall_source = "learning-calibrated-fallback" if learned_internal_length else "area-fallback"
     internal_wall_length = max(built_up_area * 0.06, min(built_up_area * 0.22, internal_wall_length))
     wall_height = 10.0
     opening_factor = 0.16
@@ -1975,6 +2172,11 @@ def _component_bbox_for_point(labels, stats, component_id):
     return {"bbox": (int(x), int(y), int(x + width - 1), int(y + height - 1)), "pixels": int(area)}
 
 
+def _bbox_area(bbox):
+    x1, y1, x2, y2 = bbox
+    return max(1, int(max(0, x2 - x1) * max(0, y2 - y1)))
+
+
 def _fallback_label_box(label, width, height):
     box_w_ratio, box_h_ratio = _label_box_defaults(label.get("type"))
     box_w = max(24, round(width * box_w_ratio))
@@ -2084,7 +2286,7 @@ def _fit_component_to_label(label, component, lines, width, height):
         fx1, fy1, fx2, fy2 = fallback["bbox"]
     return {
         "bbox": (int(fx1), int(fy1), int(fx2), int(fy2)),
-        "pixels": max(1, int((fx2 - fx1) * (fy2 - fy1))),
+        "pixels": _bbox_area((int(fx1), int(fy1), int(fx2), int(fy2))),
         "source": "label-fallback-fit",
     }
 
@@ -2283,6 +2485,21 @@ def _graphic_layer_suppressed_image(gray):
     return Image.fromarray(cleaned)
 
 
+def _perimeter_dimension_focus_image(gray):
+    arr = np.array(gray)
+    if arr.ndim != 2:
+        return None
+    height, width = arr.shape
+    band_y = max(18, round(height * 0.16))
+    band_x = max(18, round(width * 0.16))
+    focused = np.full_like(arr, 255)
+    focused[:band_y, :] = arr[:band_y, :]
+    focused[max(0, height - band_y) :, :] = arr[max(0, height - band_y) :, :]
+    focused[:, :band_x] = np.minimum(focused[:, :band_x], arr[:, :band_x])
+    focused[:, max(0, width - band_x) :] = np.minimum(focused[:, max(0, width - band_x) :], arr[:, max(0, width - band_x) :])
+    return Image.fromarray(focused)
+
+
 def _prepare_ocr_images(image):
     rgb = image.convert("RGB")
     width, height = rgb.size
@@ -2300,6 +2517,9 @@ def _prepare_ocr_images(image):
     arr = np.array(gray)
     thresholds = [int(np.percentile(arr, 58))]
     variants = [gray]
+    perimeter = _perimeter_dimension_focus_image(gray)
+    if perimeter:
+        variants.append(perimeter)
     no_lines = _line_text_separated_image(gray)
     if no_lines:
         variants.append(no_lines)
@@ -2656,7 +2876,16 @@ def detect_layout(plan_id: str, project_area: float | None = None, reprocess_att
     segmented_room_count = 0
     raw_zone_count = 0
     count_source = "geometry"
-    graph_metrics = {"edge_count": 0, "shared_wall_units": 0.0, "overlap_ratio": 0.0, "connectivity_score": 0.0, "envelope_width_units": 0.0, "envelope_height_units": 0.0}
+    graph_metrics = {
+        "edge_count": 0,
+        "shared_wall_units": 0.0,
+        "overlap_ratio": 0.0,
+        "connectivity_score": 0.0,
+        "envelope_width_units": 0.0,
+        "envelope_height_units": 0.0,
+        "tightened_room_count": 0,
+        "label_conflict_count": 0,
+    }
     service_zone_count = int(label_hints.get("service_zones") or 0) + int(label_hints.get("stair_zones") or 0)
     if raster and raster["rooms"]:
         rooms = _apply_ocr_labels_to_rooms(raster["rooms"], ocr.get("labels") or [])
@@ -2743,7 +2972,7 @@ def detect_layout(plan_id: str, project_area: float | None = None, reprocess_att
     built_up_area = round(base_area * (1.0 + (0.02 if plan["file_type"] == "dxf" else 0)), 1)
     carpet_area = round(built_up_area * 0.78, 1)
     polygon_area = round(sum(room["area_sqft"] for room in rooms) * 1.08, 1)
-    geometry_takeoff = _geometry_takeoff(rooms, built_up_area, carpet_area, wall_thickness_ft, dimension_evidence, graph_metrics)
+    geometry_takeoff = _geometry_takeoff(rooms, built_up_area, carpet_area, wall_thickness_ft, dimension_evidence, graph_metrics, learning)
     variance = abs(polygon_area - built_up_area) / built_up_area if built_up_area else 0
 
     quality_score = plan["quality"]["score"]
@@ -2767,7 +2996,15 @@ def detect_layout(plan_id: str, project_area: float | None = None, reprocess_att
         or float(dimension_evidence.get("confidence") or 0) >= 45
     )
     dimension_confidence = max(0.12, min(1.0, float(dimension_evidence.get("confidence") or 0) / 100)) if has_detected_dimensions else 0.0
-    graph_confidence = max(0.18, min(1.0, float(graph_metrics.get("connectivity_score") or 0)))
+    graph_confidence = max(
+        0.18,
+        min(
+            1.0,
+            float(graph_metrics.get("connectivity_score") or 0)
+            - min(int(graph_metrics.get("label_conflict_count") or 0), 3) * 0.04
+            - min(int(graph_metrics.get("tightened_room_count") or 0), 4) * 0.015,
+        ),
+    )
     overlap_ratio = float(graph_metrics.get("overlap_ratio") or 0)
 
     recommendations = []
@@ -2808,6 +3045,8 @@ def detect_layout(plan_id: str, project_area: float | None = None, reprocess_att
         recommendations.append(f"Detected area differs from polygon-derived area by {round(variance * 100, 1)}%. Manual verification is recommended.")
     if overlap_ratio > 0.025:
         recommendations.append(f"Wall-graph cleanup still found {round(overlap_ratio * 100, 1)}% overlapping zone area. Review corridor and open-space boundaries.")
+    if int(graph_metrics.get("label_conflict_count") or 0) > 0:
+        recommendations.append("Adjacent OCR labels still cluster in nearby wall cells. Review bedroom and bathroom names once.")
     if graph_confidence < 0.55:
         recommendations.append("Shared-wall graph is still sparse, so internal wall takeoff should be treated as provisional.")
     if polygon_completeness < 0.82:
@@ -2872,13 +3111,19 @@ def detect_layout(plan_id: str, project_area: float | None = None, reprocess_att
             "wall_graph_confidence": round(graph_confidence * 100),
             "wall_graph_edges": int(graph_metrics.get("edge_count") or 0),
             "wall_graph_overlap_percent": round(overlap_ratio * 100, 1),
+            "wall_graph_tightened_rooms": int(graph_metrics.get("tightened_room_count") or 0),
+            "label_conflicts": int(graph_metrics.get("label_conflict_count") or 0),
             "takeoff_confidence": (
+                80
+                if geometry_takeoff["dimension_source"] == "ocr-edge-bound-graph"
+                else (
                 82
                 if geometry_takeoff["dimension_source"] == "ocr-dimensions"
                 else (
                     78
                     if geometry_takeoff["dimension_source"].startswith("dxf-")
                     else (74 if geometry_takeoff["dimension_source"].startswith("ocr-") else (68 if "wall-graph" in geometry_takeoff["dimension_source"] else 62))
+                )
                 )
             ),
         },
@@ -2985,12 +3230,16 @@ def _learning_profile(plan: dict):
             "wall_thickness_ft": None,
             "room_type_counts": {},
             "average_room_area_sqft": {},
+            "internal_wall_length_per_sqft": None,
+            "dimension_source_counts": {},
         },
     )
     learning.setdefault("corrections_applied", 0)
     learning.setdefault("wall_thickness_ft", None)
     learning.setdefault("room_type_counts", {})
     learning.setdefault("average_room_area_sqft", {})
+    learning.setdefault("internal_wall_length_per_sqft", None)
+    learning.setdefault("dimension_source_counts", {})
     return learning
 
 
@@ -3005,6 +3254,21 @@ def _apply_learning_hints(label_hints: dict, learning: dict):
     enriched["halls"] = max(int(enriched.get("halls") or 0), int(room_type_counts.get("living") or 0))
     enriched["outdoor_zones"] = max(int(enriched.get("outdoor_zones") or 0), int(room_type_counts.get("balcony") or 0))
     enriched["service_zones"] = max(int(enriched.get("service_zones") or 0), int(room_type_counts.get("service") or 0))
+    if int(learning.get("corrections_applied") or 0) >= 2 and room_type_counts:
+        learned_map = {
+            "bedrooms": int(room_type_counts.get("bedroom") or 0),
+            "bathrooms": int(room_type_counts.get("bathroom") or 0),
+            "kitchens": int(room_type_counts.get("kitchen") or 0),
+            "halls": int(room_type_counts.get("living") or 0),
+            "outdoor_zones": int(room_type_counts.get("balcony") or 0),
+            "service_zones": int(room_type_counts.get("service") or 0),
+        }
+        for key, learned in learned_map.items():
+            if not learned:
+                continue
+            observed = int(enriched.get(key) or 0)
+            tolerance = 1 if key in {"bathrooms", "halls"} else 0
+            enriched[key] = max(learned, min(observed or learned, learned + tolerance))
     enriched["primary_room_count"] = enriched["bedrooms"] + enriched["kitchens"] + enriched["halls"] + enriched["outdoor_zones"]
     enriched["named_zone_count"] = enriched["primary_room_count"] + enriched["bathrooms"] + enriched["service_zones"] + int(enriched.get("stair_zones") or 0)
     enriched["has_label_hint"] = enriched["named_zone_count"] > 0 or bool(enriched.get("has_label_hint"))
@@ -3035,6 +3299,17 @@ def _update_learning_from_layout(plan: dict, rooms: list, summary: dict, user_co
             for room_type, values in area_totals.items()
             if any(value > 0 for value in values)
         }
+    built_up_area = float(summary.get("built_up_area_sqft") or 0)
+    internal_wall_length = float(summary.get("internal_wall_length_ft") or 0)
+    if built_up_area > 0 and internal_wall_length > 0:
+        observed_ratio = max(0.04, min(0.24, internal_wall_length / built_up_area))
+        current_ratio = learning.get("internal_wall_length_per_sqft")
+        learning["internal_wall_length_per_sqft"] = round((float(current_ratio) * 0.6 + observed_ratio * 0.4) if current_ratio else observed_ratio, 4)
+    dimension_source = str(summary.get("dimension_source") or "").strip()
+    if dimension_source:
+        source_counts = dict(learning.get("dimension_source_counts") or {})
+        source_counts[dimension_source] = int(source_counts.get(dimension_source) or 0) + 1
+        learning["dimension_source_counts"] = source_counts
     return learning
 
 
@@ -3161,7 +3436,7 @@ def relabel_edited_zones(plan_id: str, rooms: list, summary: dict | None = None,
     wall_thickness = round(sum(float(room.get("border_thickness_ft", 0.5)) for room in labeled_rooms) / max(len(labeled_rooms), 1), 2)
     built_up_area = round(float(base_summary.get("built_up_area_sqft") or polygon_area), 1)
     carpet_area = round(float(base_summary.get("carpet_area_sqft") or built_up_area * 0.78), 1)
-    geometry_takeoff = _geometry_takeoff(labeled_rooms, built_up_area, carpet_area, wall_thickness, (detection.get("ocr") or {}).get("dimension_evidence") or {}, graph_metrics)
+    geometry_takeoff = _geometry_takeoff(labeled_rooms, built_up_area, carpet_area, wall_thickness, (detection.get("ocr") or {}).get("dimension_evidence") or {}, graph_metrics, learning)
     variance = abs(polygon_area - built_up_area) / built_up_area if built_up_area else 0
     confidence = max(52, min(86, int(detection.get("confidence", 58)) + 8 - min(user_corrections * 2, 10) - round(min(variance, 0.25) * 20)))
     recommendations = list(detection.get("recommendations", []))
@@ -3204,6 +3479,8 @@ def relabel_edited_zones(plan_id: str, rooms: list, summary: dict | None = None,
             "wall_graph_confidence": max(detection.get("signals", {}).get("wall_graph_confidence", 0), round(float(graph_metrics.get("connectivity_score") or 0) * 100)),
             "wall_graph_edges": int(graph_metrics.get("edge_count") or 0),
             "wall_graph_overlap_percent": round(float(graph_metrics.get("overlap_ratio") or 0) * 100, 1),
+            "wall_graph_tightened_rooms": int(graph_metrics.get("tightened_room_count") or 0),
+            "label_conflicts": int(graph_metrics.get("label_conflict_count") or 0),
         },
         "confidence": confidence,
         "confidence_explanation": f"Confidence is {confidence}% because user-corrected boundaries were auto-labeled by the system and area variance is {round(variance * 100, 1)}%.",
