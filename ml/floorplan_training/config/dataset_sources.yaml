@@ -1,0 +1,23 @@
+sources:
+  primary:
+    name: peaceAsh/floorplan-room-segmentation
+    type: huggingface_rows_api
+    url: https://datasets-server.huggingface.co/rows
+    config: default
+    split: train
+    license_note: Dataset card currently lists license as unknown. Verify before commercial use.
+    purpose: Bootstrapping room polygon detection with open-source-style floorplan images.
+  recommended_next:
+    - name: CubiCasa5K
+      url: https://github.com/CubiCasa/CubiCasa5k
+      purpose: Rich room/object SVG annotations for production-grade floorplan understanding.
+    - name: FP-TXT
+      url: https://zenodo.org/records/7921780
+      purpose: Text detection annotations for floorplan OCR validation.
+    - name: MLSTRUCT-FP
+      url: https://github.com/MLSTRUCT/MLSTRUCT-FP
+      purpose: Wall annotations and large-scale architectural layouts.
+    - name: CVC-FP
+      url: https://dag.cvc.uab.es/dataset/cvc-fp-database-for-structural-floor-plan-analysis
+      purpose: Structural symbols, walls, rooms, doors, windows.
+

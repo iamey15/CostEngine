@@ -947,6 +947,11 @@ export default function FlatWiseEstimator({ project }) {
                 </div>
                 <div className="rounded-xl bg-[#EEF2FF] px-3 py-2 text-sm font-bold text-[#3730A3]">{detection.confidence}% confidence</div>
               </div>
+              {detection.geometry_reliability?.display_warning ? (
+                <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm font-semibold leading-6 text-amber-800">
+                  {detection.geometry_reliability.display_warning}
+                </div>
+              ) : null}
               <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
                 {editableFields.map(([key, label]) => (
                   <label key={key} className="text-xs font-bold uppercase tracking-wide text-[#64748B]">
@@ -976,6 +981,20 @@ export default function FlatWiseEstimator({ project }) {
                 <div className="rounded-xl border border-slate-200 bg-white p-2.5">
                   <p className="text-xs font-bold uppercase text-[#64748B]">Source</p>
                   <p className="mt-1 text-sm font-bold capitalize text-[#111827]">{String(detection.summary?.count_source || "AI fusion").replaceAll("-", " ")}</p>
+                </div>
+              </div>
+              <div className="mt-3 grid gap-2 md:grid-cols-3">
+                <div className="rounded-xl bg-slate-50 p-2.5">
+                  <p className="text-xs font-bold uppercase text-[#64748B]">Geometry mode</p>
+                  <p className="mt-1 text-sm font-bold capitalize text-[#111827]">{String(detection.summary?.layout_geometry_mode || "unknown").replaceAll("-", " ")}</p>
+                </div>
+                <div className="rounded-xl bg-slate-50 p-2.5">
+                  <p className="text-xs font-bold uppercase text-[#64748B]">Geometry confidence</p>
+                  <p className="mt-1 text-sm font-bold capitalize text-[#111827]">{detection.summary?.layout_geometry_confidence || "review"}</p>
+                </div>
+                <div className="rounded-xl bg-slate-50 p-2.5">
+                  <p className="text-xs font-bold uppercase text-[#64748B]">Fallbacks used</p>
+                  <p className="mt-1 text-sm font-bold text-[#111827]">{detection.signals?.fallback_count || 0}</p>
                 </div>
               </div>
               <div className="mt-3 rounded-xl bg-slate-50 p-3 text-sm leading-6 text-[#475569]">
@@ -1057,6 +1076,19 @@ export default function FlatWiseEstimator({ project }) {
             <div className="mt-3 rounded-xl bg-[#EEF2FF] p-3 text-xs font-semibold leading-5 text-[#3730A3]">
               The app now separates raw detected zones from actual primary rooms. Raw zones include fragments, furniture blocks, balconies, wet areas, and open geometry; they are not used as final room count without OCR confirmation.
             </div>
+            {detection.processing_trace ? (
+              <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3 text-xs leading-5 text-[#475569]">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span><strong className="text-[#111827]">Pipeline:</strong> {detection.processing_trace.path?.join(" -> ") || "not recorded"}</span>
+                  <span className="rounded-md bg-slate-100 px-2 py-1 font-bold text-[#334155]">{detection.processing_trace.pipeline_version}</span>
+                </div>
+                <div className="mt-2 grid gap-2 sm:grid-cols-3">
+                  <span><strong className="text-[#111827]">Deterministic:</strong> {detection.processing_trace.deterministic ? "Yes" : "Alternate pass"}</span>
+                  <span><strong className="text-[#111827]">Fallbacks:</strong> {(detection.processing_trace.fallbacks_used || []).join(", ") || "None"}</span>
+                  <span><strong className="text-[#111827]">Input hash:</strong> {String(detection.processing_trace.input_hash || "").slice(0, 10) || "n/a"}</span>
+                </div>
+              </div>
+            ) : null}
             {detection.ocr?.text ? (
               <div className="mt-3 rounded-xl bg-slate-50 p-3 text-xs leading-5 text-[#475569]">
                 <span className="font-bold text-[#111827]">OCR text:</span> {detection.ocr.text}

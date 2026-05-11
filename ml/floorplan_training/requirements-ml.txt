@@ -1,0 +1,13 @@
+# Keep these separate from backend/requirements.txt so Render deployment stays light.
+requests==2.32.3
+Pillow==11.1.0
+numpy==2.2.6
+opencv-python-headless==4.10.0.84
+scikit-learn==1.6.1
+joblib==1.4.2
+pandas==2.2.3
+PyYAML==6.0.2
+
+# Optional GPU/YOLO path. Install only on a training machine.
+ultralytics==8.3.59
+

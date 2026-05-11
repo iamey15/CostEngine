@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "selection_rules": {
+    "send_to_human_review_when": {
+      "confidence_below": 0.78,
+      "ocr_dimension_confidence_below": 0.7,
+      "room_count_variance_above": 0.18,
+      "polygon_open_boundary_ratio_above": 0.08,
+      "label_conflicts_above": 0
+    },
+    "prioritize_next_training_batch": [
+      "user_corrected_zones",
+      "low_confidence_with_confirmed_area",
+      "new_file_type_or_new_template",
+      "high_ocr_confidence_but_geometry_mismatch",
+      "high_geometry_confidence_but_ocr_mismatch"
+    ]
+  },
+  "llm_validator": {
+    "send_full_image": false,
+    "max_labels": 40,
+    "max_dimensions": 40,
+    "purpose": "Validate compact OCR and geometry JSON only."
+  }
+}

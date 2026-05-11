@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import math
 import os
@@ -52,6 +53,7 @@ PLAN_META_DIR.mkdir(parents=True, exist_ok=True)
 
 PLAN_STORE = {}
 EASYOCR_READER = None
+PIPELINE_VERSION = "flat-plan-detection-v4"
 
 MATERIAL_RATES = {
     "steel": 74,
@@ -126,6 +128,86 @@ def _quality_from_file(file_name: str, data: bytes):
     else:
         score -= 8
     return {"score": max(45, min(94, score)), "size": size, "notes": notes}
+
+
+def _sha256_bytes(data: bytes):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _geometry_reliability(plan: dict, rooms: list, raster: dict | None, count_source: str, graph_metrics: dict, variance: float):
+    if plan.get("demo"):
+        mode = "demo"
+        source = "demo_sample"
+    elif not rooms:
+        mode = "none"
+        source = "no_geometry"
+    else:
+        room_sources = {str(room.get("source") or "unknown") for room in rooms}
+        if any(source.startswith(("wall-line-snap", "ocr-anchored", "geometry+ocr")) for source in room_sources):
+            mode = "detected"
+            source = raster.get("detector", "wall_geometry") if raster else "wall_geometry"
+        elif any(source.startswith(("dxf-text-position", "pdf-vector-text")) for source in room_sources):
+            mode = "anchored"
+            source = "vector_or_text_anchor"
+        elif any(source.startswith(("calculated-count-layout", "ocr-count-inferred", "label-fallback-fit")) for source in room_sources):
+            mode = "estimated"
+            source = "count_based_estimate"
+        else:
+            mode = "estimated"
+            source = count_source or "unknown"
+
+    graph_score = float((graph_metrics or {}).get("connectivity_score") or 0)
+    if mode == "detected" and graph_score >= 0.55 and variance <= 0.08:
+        confidence = "high"
+    elif mode in {"detected", "anchored"} and variance <= 0.14:
+        confidence = "medium"
+    elif mode == "estimated":
+        confidence = "low"
+    else:
+        confidence = "review"
+
+    return {
+        "mode": mode,
+        "source": source,
+        "confidence": confidence,
+        "is_actual_geometry": mode == "detected",
+        "is_approximate": mode in {"anchored", "estimated", "demo"},
+        "display_warning": (
+            "Detected zones are approximate and should be reviewed on the canvas before pricing."
+            if mode in {"anchored", "estimated"}
+            else ("Demo zones are synthetic sample data." if mode == "demo" else "")
+        ),
+    }
+
+
+def _pipeline_trace(plan: dict, raster: dict | None, dxf: dict, ocr: dict, count_source: str, geometry_takeoff: dict, fallbacks: list[str], reprocess_attempt: int):
+    path = []
+    if plan.get("file_type") == "dxf":
+        path.append("dxf_vector_parse")
+    if plan.get("file_type") == "pdf":
+        path.append("pdf_text_or_preview_extract")
+    if ocr.get("available"):
+        path.append("ocr_preprocess_and_text")
+    if raster:
+        path.append(raster.get("detector") or "raster_geometry")
+    if dxf.get("labels"):
+        path.append("cad_label_fusion")
+    if count_source:
+        path.append(count_source)
+    path.append(geometry_takeoff.get("dimension_source") or "takeoff")
+    return {
+        "pipeline_version": PIPELINE_VERSION,
+        "input_hash": plan.get("file_hash"),
+        "file_type": plan.get("file_type"),
+        "reprocess_attempt": int(reprocess_attempt or 0),
+        "path": [item for index, item in enumerate(path) if item and item not in path[:index]],
+        "fallbacks_used": fallbacks,
+        "deterministic": int(reprocess_attempt or 0) == 0,
+        "count_source": count_source,
+        "dimension_source": geometry_takeoff.get("dimension_source"),
+        "ocr_available": bool(ocr.get("available")),
+        "dxf_labels": len(dxf.get("labels") or []),
+    }
 
 
 AREA_VALUE_RE = re.compile(r"(\d{2,6}(?:\.\d+)?)\s*(?:SQFT|SQ\.FT|SQ\s*FT|SOFT)")
@@ -322,6 +404,11 @@ def _recover_plan_from_disk(plan_id: str):
             plan = json.loads(meta_path.read_text(encoding="utf-8"))
             path = Path(plan.get("path", ""))
             if path.exists():
+                if not plan.get("file_hash"):
+                    try:
+                        plan["file_hash"] = _sha256_bytes(path.read_bytes())
+                    except Exception:
+                        plan["file_hash"] = None
                 PLAN_STORE[plan_id] = plan
                 return plan
         except Exception:
@@ -344,6 +431,7 @@ def _recover_plan_from_disk(plan_id: str):
         "file_name": path.name,
         "file_type": ext,
         "path": str(path),
+        "file_hash": _sha256_bytes(data),
         "quality": _quality_from_file(path.name, data),
         "dxf_meta": _parse_dxf(path) if ext == "dxf" else {},
         "pdf_meta": pdf_meta,
@@ -577,6 +665,7 @@ def register_plan(file_name: str, data: bytes, project_id: int, demo: bool = Fal
     path = UPLOAD_DIR / f"{plan_id}.{ext}"
     path.write_bytes(data)
     quality = _quality_from_file(file_name, data)
+    file_hash = _sha256_bytes(data)
     dxf_meta = _parse_dxf(path) if ext == "dxf" else {}
     pdf_meta = _pdf_plan_text_and_preview(path) if ext == "pdf" else {}
     label_hints = _label_hints_from_text(f"{file_name} {pdf_meta.get('text') or ''}")
@@ -592,6 +681,7 @@ def register_plan(file_name: str, data: bytes, project_id: int, demo: bool = Fal
         "file_name": file_name,
         "file_type": ext,
         "path": str(path),
+        "file_hash": file_hash,
         "quality": quality,
         "dxf_meta": dxf_meta,
         "pdf_meta": pdf_meta,
@@ -605,6 +695,7 @@ def register_plan(file_name: str, data: bytes, project_id: int, demo: bool = Fal
         "file_name": file_name,
         "file_type": ext,
         "image_size": quality.get("size"),
+        "file_hash": file_hash,
         "quality_score": quality["score"],
         "preview_data_url": preview_data_url,
         "message": "Floorplan uploaded and ready for AI-assisted layout processing.",
@@ -1413,14 +1504,25 @@ def _extract_dimension_evidence(text: str, base_area: float | None = None, dimen
 
     horizontal_values = [edge_sums[edge] for edge in ("top", "bottom") if edge in edge_sums]
     vertical_values = [edge_sums[edge] for edge in ("left", "right") if edge in edge_sums]
+    edge_binding_axes = int(bool(horizontal_values)) + int(bool(vertical_values))
     edge_area = round(max(horizontal_values) * max(vertical_values), 1) if horizontal_values and vertical_values else None
     exterior_width = max(horizontal_values) if horizontal_values else None
     exterior_depth = max(vertical_values) if vertical_values else None
     sorted_dims = sorted(unique_dims, reverse=True)
-    if not exterior_width and sorted_dims and len(unique_dims) >= 2:
-        exterior_width = sorted_dims[0]
-    if not exterior_depth and len(sorted_dims) > 1:
-        exterior_depth = sorted_dims[1]
+    if edge_binding_axes == 0:
+        if not exterior_width and sorted_dims and len(unique_dims) >= 2:
+            exterior_width = sorted_dims[0]
+        if not exterior_depth and len(sorted_dims) > 1:
+            exterior_depth = sorted_dims[1]
+    elif edge_binding_axes == 1:
+        # One bound exterior axis is useful, but the missing span should be
+        # recovered from wall geometry rather than guessed from same-edge OCR.
+        if horizontal_values:
+            exterior_width = max(horizontal_values)
+            exterior_depth = None
+        else:
+            exterior_width = None
+            exterior_depth = max(vertical_values)
     reference_area = float(base_area or total_area or 0)
     if exterior_width and exterior_depth and reference_area and exterior_width * exterior_depth < 0.35 * reference_area:
         if horizontal_values and not vertical_values:
@@ -1444,13 +1546,15 @@ def _extract_dimension_evidence(text: str, base_area: float | None = None, dimen
         confidence = max(confidence, 82)
     elif horizontal_values and vertical_values:
         confidence = max(confidence, 74)
+    elif edge_binding_axes == 1:
+        confidence = min(confidence, 78 if total_area else 70)
     return {
         "dimensions_ft": sorted(unique_dims),
         "dimension_count": len(unique_dims),
         "dimension_boxes": boxes,
         "edge_sums_ft": edge_sums,
         "edge_dimension_counts": edge_counts,
-        "edge_binding_axes": int(bool(horizontal_values)) + int(bool(vertical_values)),
+        "edge_binding_axes": edge_binding_axes,
         "room_area_values_sqft": room_area_values[:24],
         "area_from_text_sqft": round(total_area, 1) if total_area else None,
         "edge_area_sqft": edge_area,
@@ -1614,18 +1718,60 @@ def _shared_wall_units(bounds_a: dict, bounds_b: dict, tolerance=2.2):
 
 def _room_label_anchor(room: dict, bounds: dict | None = None):
     bounds = bounds or _room_bounds(room)
+    metrics = _label_render_metrics(room, bounds)
+    max_label_x = max(bounds["min_x"] + 0.8, bounds["max_x"] - metrics["footprint_width"] - 0.8)
     explicit_x = room.get("label_x")
     explicit_y = room.get("label_y")
     if explicit_x is not None and explicit_y is not None:
-        x = float(explicit_x)
+        x = max(bounds["min_x"] + 0.8, min(max_label_x, float(explicit_x)))
         y = float(explicit_y)
-        if bounds["min_x"] + 1 <= x <= bounds["max_x"] - 1 and bounds["min_y"] + 2 <= y <= bounds["max_y"] - 2:
+        if bounds["min_x"] + 0.6 <= x <= bounds["max_x"] - 0.6 and bounds["min_y"] + 2 <= y <= bounds["max_y"] - 2:
             return round(x, 1), round(y, 1)
-    x = max(bounds["min_x"] + 1.8, min(bounds["max_x"] - 10.0, bounds["min_x"] + min(bounds["width"] * 0.18, 7.0)))
+    x = max(bounds["min_x"] + 0.8, min(max_label_x, bounds["min_x"] + min(bounds["width"] * 0.16, 5.6)))
     y = max(bounds["min_y"] + 5.2, min(bounds["max_y"] - 4.8, bounds["min_y"] + min(bounds["height"] * 0.24, 7.4)))
-    if bounds["width"] < 12:
-        x = bounds["min_x"] + 1.3
+    if bounds["width"] < metrics["footprint_width"] + 2.6:
+        x = bounds["min_x"] + 0.8
     return round(x, 1), round(y, 1)
+
+
+def _label_render_metrics(room: dict, bounds: dict | None = None):
+    bounds = bounds or _room_bounds(room)
+    label = re.sub(r"\s+", " ", str(room.get("label") or room.get("type") or "Zone")).strip() or "Zone"
+    label_width = 2.8 + len(label) * 0.78 + (0.8 if re.search(r"\d", label) else 0.0)
+    max_width = max(4.8, bounds["width"] - 1.6)
+    label_width = max(4.8, min(label_width, max_width))
+    area_text = f"{round(float(room.get('area_sqft') or 0))} sqft"
+    area_width = max(4.2, min(3.4 + len(area_text) * 0.58, max(4.2, bounds["width"] - 1.8)))
+    return {
+        "label_width": round(label_width, 2),
+        "footprint_width": round(max(label_width, area_width), 2),
+        "footprint_height": 7.2,
+    }
+
+
+def _label_footprint(candidate: tuple[float, float], room: dict, bounds: dict):
+    metrics = _label_render_metrics(room, bounds)
+    max_label_x = max(bounds["min_x"] + 0.8, bounds["max_x"] - metrics["footprint_width"] - 0.8)
+    x = max(bounds["min_x"] + 0.8, min(max_label_x, float(candidate[0])))
+    y = max(bounds["min_y"] + 4.8, min(bounds["max_y"] - 3.0, float(candidate[1])))
+    return {
+        "min_x": round(x - 0.4, 2),
+        "max_x": round(x + metrics["footprint_width"], 2),
+        "min_y": round(y - 3.1, 2),
+        "max_y": round(min(bounds["max_y"] - 0.4, y + metrics["footprint_height"]), 2),
+        "anchor_x": round(x, 2),
+        "anchor_y": round(y, 2),
+    }
+
+
+def _label_footprint_clearance(a: dict, b: dict):
+    overlap_x = max(0.0, min(a["max_x"], b["max_x"]) - max(a["min_x"], b["min_x"]))
+    overlap_y = max(0.0, min(a["max_y"], b["max_y"]) - max(a["min_y"], b["min_y"]))
+    if overlap_x > 0 and overlap_y > 0:
+        return -max(overlap_x, overlap_y)
+    gap_x = max(0.0, max(a["min_x"], b["min_x"]) - min(a["max_x"], b["max_x"]))
+    gap_y = max(0.0, max(a["min_y"], b["min_y"]) - min(a["max_y"], b["max_y"]))
+    return math.hypot(gap_x, gap_y)
 
 
 def _anchor_interval_around_value(value: float, minimum: float, maximum: float, anchors: list[float]):
@@ -1691,18 +1837,23 @@ def _tighten_room_bounds_to_label_cell(room: dict, bounds: dict, x_anchors: list
 
 def _label_anchor_candidates(room: dict, bounds: dict):
     explicit = room.get("label_x"), room.get("label_y")
+    metrics = _label_render_metrics(room, bounds)
+    min_label_x = bounds["min_x"] + 0.8
+    max_label_x = max(min_label_x, bounds["max_x"] - metrics["footprint_width"] - 0.8)
     candidates = []
     if explicit[0] is not None and explicit[1] is not None:
-        x = float(explicit[0])
+        x = max(min_label_x, min(max_label_x, float(explicit[0])))
         y = float(explicit[1])
-        if bounds["min_x"] + 1 <= x <= bounds["max_x"] - 1 and bounds["min_y"] + 2 <= y <= bounds["max_y"] - 2:
+        if bounds["min_x"] + 0.6 <= x <= bounds["max_x"] - 0.6 and bounds["min_y"] + 2 <= y <= bounds["max_y"] - 2:
             candidates.append((round(x, 1), round(y, 1)))
-    left = round(bounds["min_x"] + min(max(bounds["width"] * 0.14, 1.4), 6.8), 1)
-    center = round((bounds["min_x"] + bounds["max_x"]) / 2, 1)
-    right = round(bounds["max_x"] - min(max(bounds["width"] * 0.18, 2.2), 8.6), 1)
+    left = round(min_label_x, 1)
+    center = round(max(min_label_x, min(max_label_x, (bounds["min_x"] + bounds["max_x"] - metrics["footprint_width"]) / 2)), 1)
+    right = round(max_label_x, 1)
+    mid_left = round(max(min_label_x, min(max_label_x, min_label_x + (max_label_x - min_label_x) * 0.38)), 1)
     top = round(min(bounds["max_y"] - 5.0, bounds["min_y"] + min(max(bounds["height"] * 0.24, 5.0), 7.8)), 1)
     middle = round((bounds["min_y"] + bounds["max_y"]) / 2, 1)
-    for candidate in ((left, top), (center, top), (right, top), (left, middle), (center, middle)):
+    lower = round(min(bounds["max_y"] - 3.0, max(bounds["min_y"] + 5.0, middle + 2.4)), 1)
+    for candidate in ((left, top), (center, top), (right, top), (mid_left, middle), (left, lower)):
         if candidate not in candidates:
             candidates.append(candidate)
     return candidates
@@ -1726,26 +1877,31 @@ def _deconflict_label_anchors(rooms: list):
         center_x = (bounds["min_x"] + bounds["max_x"]) / 2
         center_y = (bounds["min_y"] + bounds["max_y"]) / 2
         best = None
+        best_footprint = None
         best_score = None
         for candidate in _label_anchor_candidates(room, bounds):
-            min_distance = min((math.hypot(candidate[0] - point[0], candidate[1] - point[1]) for point in chosen), default=999.0)
-            score = min_distance - math.hypot(candidate[0] - center_x, candidate[1] - center_y) * 0.08
+            footprint = _label_footprint(candidate, room, bounds)
+            min_clearance = min((_label_footprint_clearance(footprint, existing) for existing in chosen), default=999.0)
+            score = min_clearance - math.hypot(footprint["anchor_x"] - center_x, footprint["anchor_y"] - center_y) * 0.06
             if best is None or score > best_score:
                 best = candidate
+                best_footprint = footprint
                 best_score = score
         if best:
-            room["label_x"] = round(best[0], 1)
-            room["label_y"] = round(best[1], 1)
-            room["label_area_y"] = round(min(bounds["max_y"] - 1.4, best[1] + 4.3), 1)
-            chosen.append(best)
+            room["label_x"] = round(best_footprint["anchor_x"], 1)
+            room["label_y"] = round(best_footprint["anchor_y"], 1)
+            room["label_area_y"] = round(min(bounds["max_y"] - 1.4, best_footprint["anchor_y"] + 4.3), 1)
+            chosen.append(best_footprint)
     conflicts = 0
     for left in range(len(rooms)):
         left_room = rooms[left]
-        left_anchor = (float(left_room.get("label_x") or 0), float(left_room.get("label_y") or 0))
+        left_bounds = left_room.get("bbox") or _room_bounds(left_room)
+        left_footprint = _label_footprint((float(left_room.get("label_x") or 0), float(left_room.get("label_y") or 0)), left_room, left_bounds)
         for right in range(left + 1, len(rooms)):
             right_room = rooms[right]
-            right_anchor = (float(right_room.get("label_x") or 0), float(right_room.get("label_y") or 0))
-            if math.hypot(left_anchor[0] - right_anchor[0], left_anchor[1] - right_anchor[1]) < 5.4:
+            right_bounds = right_room.get("bbox") or _room_bounds(right_room)
+            right_footprint = _label_footprint((float(right_room.get("label_x") or 0), float(right_room.get("label_y") or 0)), right_room, right_bounds)
+            if _label_footprint_clearance(left_footprint, right_footprint) < 0.8:
                 conflicts += 1
     return conflicts
 
@@ -1918,8 +2074,12 @@ def _geometry_takeoff(rooms: list, built_up_area: float, carpet_area: float, wal
     if not width and edge_bound_width:
         width = float(edge_bound_width)
         width_from_edge = True
+    elif width and edge_bound_width and abs(float(width) - float(edge_bound_width)) <= 0.25:
+        width_from_edge = True
     if not depth and edge_bound_depth:
         depth = float(edge_bound_depth)
+        depth_from_edge = True
+    elif depth and edge_bound_depth and abs(float(depth) - float(edge_bound_depth)) <= 0.25:
         depth_from_edge = True
     if width and depth:
         external_wall_length = 2 * (float(width) + float(depth))
@@ -2876,6 +3036,7 @@ def detect_layout(plan_id: str, project_area: float | None = None, reprocess_att
     segmented_room_count = 0
     raw_zone_count = 0
     count_source = "geometry"
+    fallbacks_used = []
     graph_metrics = {
         "edge_count": 0,
         "shared_wall_units": 0.0,
@@ -2915,6 +3076,7 @@ def detect_layout(plan_id: str, project_area: float | None = None, reprocess_att
                 room_count = label_primary_rooms
                 label_override = True
                 count_source = "ocr-label-fusion"
+                fallbacks_used.append("ocr_label_count_override")
             else:
                 room_count = max(segment_counts["primary"], bedroom_count + kitchen_count + hall_count)
         else:
@@ -2928,6 +3090,7 @@ def detect_layout(plan_id: str, project_area: float | None = None, reprocess_att
                 refined = _refine_rooms_with_wall_graph(label_rooms)
                 rooms = refined["rooms"]
                 graph_metrics = refined["graph"]
+                fallbacks_used.append("ocr_label_geometry_rebuild")
     elif dxf.get("labels"):
         cad_counts = _counts_from_hints_and_dxf(label_hints, dxf)
         bedroom_count = cad_counts["bedroom"]
@@ -2951,10 +3114,14 @@ def detect_layout(plan_id: str, project_area: float | None = None, reprocess_att
     if not (raster and raster["rooms"]):
         if plan.get("demo"):
             rooms = _demo_rooms(base_area)
+            fallbacks_used.append("demo_sample_layout")
         elif dxf.get("labels"):
             rooms = _rooms_from_dxf_text_entities(dxf, base_area, label_hints)
+            fallbacks_used.append("dxf_text_position_layout" if dxf.get("text_entities") else "calculated_cad_label_layout")
         else:
             rooms = []
+            if not plan.get("demo"):
+                fallbacks_used.append("no_layout_geometry_available")
         refined = _refine_rooms_with_wall_graph(rooms)
         rooms = refined["rooms"]
         graph_metrics = refined["graph"]
@@ -2974,6 +3141,8 @@ def detect_layout(plan_id: str, project_area: float | None = None, reprocess_att
     polygon_area = round(sum(room["area_sqft"] for room in rooms) * 1.08, 1)
     geometry_takeoff = _geometry_takeoff(rooms, built_up_area, carpet_area, wall_thickness_ft, dimension_evidence, graph_metrics, learning)
     variance = abs(polygon_area - built_up_area) / built_up_area if built_up_area else 0
+    geometry_reliability = _geometry_reliability(plan, rooms, raster, count_source, graph_metrics, variance)
+    processing_trace = _pipeline_trace(plan, raster, dxf, ocr, count_source, geometry_takeoff, fallbacks_used, reprocess_attempt)
 
     quality_score = plan["quality"]["score"]
     if raster:
@@ -3041,6 +3210,8 @@ def detect_layout(plan_id: str, project_area: float | None = None, reprocess_att
             recommendations.append(f"Dimension pattern engine found {dimension_evidence.get('dimension_count', 0)} dimension value(s); takeoff source is {geometry_takeoff['dimension_source'].replace('-', ' ')}.")
         else:
             recommendations.append(f"Vector geometry calibrated the envelope span; takeoff source is {geometry_takeoff['dimension_source'].replace('-', ' ')}.")
+    if int(dimension_evidence.get("edge_binding_axes") or 0) == 1 and "wall-graph" in geometry_takeoff["dimension_source"]:
+        recommendations.append("Only one exterior dimension axis was bound from OCR. The perpendicular span was recovered from wall graph and area cross-check.")
     if variance > 0.06:
         recommendations.append(f"Detected area differs from polygon-derived area by {round(variance * 100, 1)}%. Manual verification is recommended.")
     if overlap_ratio > 0.025:
@@ -3055,6 +3226,8 @@ def detect_layout(plan_id: str, project_area: float | None = None, reprocess_att
         recommendations.append("Low OCR confidence around wet-area labels. Bathroom count should be confirmed.")
     if not recommendations:
         recommendations.append("Layout geometry is consistent enough for a demo-grade flat-wise estimate.")
+    if geometry_reliability["display_warning"]:
+        recommendations.insert(0, geometry_reliability["display_warning"])
 
     confidence = _score_confidence(
         {
@@ -3087,6 +3260,11 @@ def detect_layout(plan_id: str, project_area: float | None = None, reprocess_att
             "wet_area_count": bathroom_count,
             "service_zone_count": service_zone_count,
             "count_source": count_source,
+            "layout_geometry_mode": geometry_reliability["mode"],
+            "layout_geometry_source": geometry_reliability["source"],
+            "layout_geometry_confidence": geometry_reliability["confidence"],
+            "layout_is_actual_geometry": geometry_reliability["is_actual_geometry"],
+            "layout_is_approximate": geometry_reliability["is_approximate"],
             "bedroom_count": bedroom_count,
             "bathroom_count": bathroom_count,
             "kitchen_count": kitchen_count,
@@ -3108,6 +3286,7 @@ def detect_layout(plan_id: str, project_area: float | None = None, reprocess_att
             "segmented_zone_count": segmented_room_count,
             "named_zone_count": label_hints.get("named_zone_count") or 0,
             "dimension_confidence": dimension_evidence.get("confidence", 0),
+            "dimension_binding_axes": int(dimension_evidence.get("edge_binding_axes") or 0),
             "wall_graph_confidence": round(graph_confidence * 100),
             "wall_graph_edges": int(graph_metrics.get("edge_count") or 0),
             "wall_graph_overlap_percent": round(overlap_ratio * 100, 1),
@@ -3126,7 +3305,10 @@ def detect_layout(plan_id: str, project_area: float | None = None, reprocess_att
                 )
                 )
             ),
+            "fallback_count": len(fallbacks_used),
         },
+        "processing_trace": processing_trace,
+        "geometry_reliability": geometry_reliability,
         "confidence": confidence,
         "confidence_explanation": _confidence_explanation(confidence, plan, variance, dxf, dimension_confidence, graph_confidence, overlap_ratio),
         "recommendations": recommendations,
